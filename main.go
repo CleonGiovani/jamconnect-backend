@@ -262,6 +262,50 @@ func checkEmailHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"exists": exists})
 }
 
+// POST /resend-code  { "email": "..." }
+// Generates a fresh verification code for an existing, unverified
+// account and returns it (simulated email). Useful if the original
+// code was missed — which is easy to do, since it's only ever shown
+// briefly in the app rather than actually emailed.
+func resendCodeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	var req signUpRequest // only the Email field is used here
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request body"})
+		return
+	}
+
+	email := normalizeEmail(req.Email)
+
+	usersMu.Lock()
+	u, exists := users[email]
+	usersMu.Unlock()
+
+	if !exists {
+		writeJSON(w, http.StatusNotFound, apiResponse{Message: "No account found for this email."})
+		return
+	}
+	if u.Verified {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "This account is already verified."})
+		return
+	}
+
+	code := generateCode()
+	pendingMu.Lock()
+	pending[email] = code
+	pendingMu.Unlock()
+
+	writeJSON(w, http.StatusOK, apiResponse{
+		Success: true,
+		Message: "New verification code generated (simulated email).",
+		Code:    code,
+	})
+}
+
 func generateCode() string {
 	return fmt.Sprintf("%06d", rand.Intn(1000000))
 }
@@ -305,6 +349,7 @@ func main() {
 	http.HandleFunc("/verify", withCORS(verifyHandler))
 	http.HandleFunc("/login", withCORS(loginHandler))
 	http.HandleFunc("/check-email", withCORS(checkEmailHandler))
+	http.HandleFunc("/resend-code", withCORS(resendCodeHandler))
 
 	log.Printf("JamConnect backend starting on port %s\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
