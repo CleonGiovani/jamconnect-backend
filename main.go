@@ -16,6 +16,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -229,6 +230,38 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Login successful."})
 }
 
+// GET /check-email?email=...
+// Looks up whether an account exists for this email, WITHOUT
+// requiring a password. Used by the sign-up screen to warn the
+// user early that an email is already taken, before they type
+// out a whole password.
+//
+// Security note: publicly confirming "this email exists" is
+// known as account enumeration — it lets someone probe which
+// emails are registered. That's an accepted tradeoff for a
+// sign-up "is this taken?" check (most real apps do this), but
+// you would NOT do the same thing on a password-reset flow —
+// there, best practice is to always say "if this email exists,
+// we've sent a link" regardless of the real answer.
+func checkEmailHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use GET"})
+		return
+	}
+
+	email := normalizeEmail(r.URL.Query().Get("email"))
+	if email == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Missing email query parameter."})
+		return
+	}
+
+	usersMu.Lock()
+	_, exists := users[email]
+	usersMu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]bool{"exists": exists})
+}
+
 func generateCode() string {
 	return fmt.Sprintf("%06d", rand.Intn(1000000))
 }
@@ -256,12 +289,23 @@ func withCORS(handler http.HandlerFunc) http.HandlerFunc {
 }
 
 // --- Entry point ---
+// Hosting platforms like Render assign a port dynamically and tell
+// your app which one to use via the PORT environment variable — your
+// server MUST listen on that port, not a hardcoded one, or the
+// platform won't be able to route traffic to it. Locally, no PORT
+// variable is set, so we fall back to 8080 like before.
 func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
 	http.HandleFunc("/health", withCORS(healthHandler))
 	http.HandleFunc("/signup", withCORS(signUpHandler))
 	http.HandleFunc("/verify", withCORS(verifyHandler))
 	http.HandleFunc("/login", withCORS(loginHandler))
+	http.HandleFunc("/check-email", withCORS(checkEmailHandler))
 
-	log.Println("JamConnect backend starting on http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Printf("JamConnect backend starting on port %s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
