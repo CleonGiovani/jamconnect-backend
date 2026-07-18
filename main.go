@@ -44,6 +44,14 @@ var (
 	users     = map[string]*user{} // key: normalized email
 	pendingMu sync.Mutex
 	pending   = map[string]string{} // key: email, value: verification code
+
+	// Separate from signup verification codes above — this map holds
+	// password-reset codes. Kept distinct because they mean different
+	// things: a signup code proves "this email can receive mail before
+	// we let you in at all"; a reset code proves "you still control
+	// this already-verified account" for an existing user.
+	resetCodesMu sync.Mutex
+	resetCodes   = map[string]string{}
 )
 
 var emailRegex = regexp.MustCompile(`^[\w.\-]+@[\w\-]+\.[a-zA-Z]{2,}$`)
@@ -73,6 +81,12 @@ type loginRequest struct {
 type verifyRequest struct {
 	Email string `json:"email"`
 	Code  string `json:"code"`
+}
+
+type resetPasswordRequest struct {
+	Email       string `json:"email"`
+	Code        string `json:"code"`
+	NewPassword string `json:"newPassword"`
 }
 
 type apiResponse struct {
@@ -310,6 +324,95 @@ func generateCode() string {
 	return fmt.Sprintf("%06d", rand.Intn(1000000))
 }
 
+// POST /forgot-password  { "email": "..." }
+// Generates a password-reset code (simulated email, same as signup).
+//
+// Security note: unlike /check-email and /resend-code, this endpoint
+// deliberately gives the SAME response whether or not the email is
+// registered. Confirming "no account exists" on a password-reset
+// endpoint specifically is a known way to leak which emails are
+// registered to an attacker doing a targeted account takeover — so
+// real apps always say something like "if that account exists, we've
+// sent a code" here, even though it's fine to be specific on sign-up.
+func forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	var req signUpRequest // only Email is used
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request body"})
+		return
+	}
+
+	email := normalizeEmail(req.Email)
+	code := generateCode()
+
+	resetCodesMu.Lock()
+	resetCodes[email] = code
+	resetCodesMu.Unlock()
+
+	// NOTE: because we have no real email system, the code is returned
+	// directly here so the UI can display it — a real app would omit
+	// `code` entirely and only ever deliver it via an actual email.
+	writeJSON(w, http.StatusOK, apiResponse{
+		Success: true,
+		Message: "If that account exists, a reset code has been generated (simulated email).",
+		Code:    code,
+	})
+}
+
+// POST /reset-password  { "email": "...", "code": "...", "newPassword": "..." }
+func resetPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	var req resetPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request body"})
+		return
+	}
+
+	email := normalizeEmail(req.Email)
+
+	resetCodesMu.Lock()
+	expected, ok := resetCodes[email]
+	resetCodesMu.Unlock()
+
+	// Same generic error whether the code is wrong OR the account
+	// doesn't exist at all — keeps behavior consistent with the
+	// non-enumeration note above.
+	if !ok || expected != strings.TrimSpace(req.Code) {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect or expired reset code."})
+		return
+	}
+
+	if len(req.NewPassword) < 15 {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Password must be at least 15 characters long."})
+		return
+	}
+	if len(req.NewPassword) > 64 {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Password must be 64 characters or fewer."})
+		return
+	}
+
+	usersMu.Lock()
+	u, exists := users[email]
+	if exists {
+		u.Password = req.NewPassword
+	}
+	usersMu.Unlock()
+
+	resetCodesMu.Lock()
+	delete(resetCodes, email)
+	resetCodesMu.Unlock()
+
+	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Password reset successfully."})
+}
+
 // =============================================================
 // SECTION: CORS middleware
 // Your Flutter web app runs on a different port (e.g. localhost:
@@ -350,6 +453,8 @@ func main() {
 	http.HandleFunc("/login", withCORS(loginHandler))
 	http.HandleFunc("/check-email", withCORS(checkEmailHandler))
 	http.HandleFunc("/resend-code", withCORS(resendCodeHandler))
+	http.HandleFunc("/forgot-password", withCORS(forgotPasswordHandler))
+	http.HandleFunc("/reset-password", withCORS(resetPasswordHandler))
 
 	log.Printf("JamConnect backend starting on port %s\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
