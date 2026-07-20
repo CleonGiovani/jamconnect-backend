@@ -406,6 +406,82 @@ func checkEmailHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"exists": err == nil})
 }
 
+// providerListing is what each row of GET /providers returns — every
+// field the Dashboard's list AND the full profile detail screen need,
+// so the frontend never has to make a second request per provider.
+type providerListing struct {
+	Email              string  `json:"email"`
+	FullName           string  `json:"fullName"`
+	Phone              string  `json:"phone"`
+	Parish             string  `json:"parish"`
+	BusinessName       string  `json:"businessName"`
+	Category           string  `json:"category"`
+	Description        string  `json:"description"`
+	YearsExperience    int     `json:"yearsExperience"`
+	BusinessRegistered bool    `json:"businessRegistered"`
+	StartingRate       float64 `json:"startingRate"`
+	RateType           string  `json:"rateType"`
+}
+
+// GET /providers
+// Returns every VERIFIED service provider — this is the endpoint that
+// actually closes the biggest gap in the app: previously, the
+// Dashboard showed 8 hardcoded fake businesses that never changed no
+// matter who signed up. Now it reflects real accounts. Unverified
+// providers are deliberately excluded — showing an account before its
+// owner confirmed their email would let anyone list a fake business.
+func providersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use GET"})
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT u.email, u.full_name, u.phone, u.parish,
+		       p.business_name, p.category, p.description,
+		       p.years_experience, p.business_registered,
+		       p.starting_rate, p.rate_type
+		FROM users u
+		JOIN service_provider_profiles p ON p.email = u.email
+		WHERE u.verified = TRUE
+		ORDER BY p.business_name
+	`)
+	if err != nil {
+		log.Printf("[PROVIDERS] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	defer rows.Close()
+
+	providers := []providerListing{} // starts as [] not null, so empty JSON is "[]" not "null"
+	for rows.Next() {
+		var p providerListing
+		if err := rows.Scan(
+			&p.Email, &p.FullName, &p.Phone, &p.Parish,
+			&p.BusinessName, &p.Category, &p.Description,
+			&p.YearsExperience, &p.BusinessRegistered,
+			&p.StartingRate, &p.RateType,
+		); err != nil {
+			log.Printf("[PROVIDERS] row scan error: %v", err)
+			continue
+		}
+		providers = append(providers, p)
+	}
+
+	// rows.Next() returning false means either "no more rows" (normal)
+	// or "something went wrong mid-read" (e.g. connection dropped) --
+	// checking rows.Err() afterward is how you tell those apart. Without
+	// this, a dropped connection partway through would silently return
+	// a truncated list with no error at all.
+	if err := rows.Err(); err != nil {
+		log.Printf("[PROVIDERS] error while reading rows: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, providers)
+}
+
 // POST /resend-code  { "email": "..." }
 func resendCodeHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -567,6 +643,7 @@ func main() {
 	http.HandleFunc("/verify", withCORS(verifyHandler))
 	http.HandleFunc("/login", withCORS(loginHandler))
 	http.HandleFunc("/check-email", withCORS(checkEmailHandler))
+	http.HandleFunc("/providers", withCORS(providersHandler))
 	http.HandleFunc("/resend-code", withCORS(resendCodeHandler))
 	http.HandleFunc("/forgot-password", withCORS(forgotPasswordHandler))
 	http.HandleFunc("/reset-password", withCORS(resetPasswordHandler))
