@@ -1,16 +1,23 @@
 // =============================================================
 // JamConnect Backend — main.go
-// This is the entry point for your Go server. Right now it just
-// has one endpoint (/health) to prove the server runs and Flutter
-// can reach it. We'll add /signup, /login, and /verify next,
-// each mirroring the logic currently living in AuthService on
-// the Flutter side — except this time, data will live on the
-// server instead of the device.
+// Now backed by a real MySQL database running in Docker, instead
+// of an in-memory map. This is what fixes the "no account found
+// after I already created one" bug: previously, every account
+// only ever lived in RAM, so it vanished the instant the server
+// process restarted. MySQL persists to disk (inside the Docker
+// volume), so accounts survive restarts, redeploys, and your Mac
+// rebooting.
+//
+// Every important event (signup, login, verify, reset) logs a
+// line to stdout — visible live in whichever Terminal tab runs
+// `go run main.go`, the same way `docker logs <container>` shows
+// what a container is doing.
 // =============================================================
 
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -19,58 +26,125 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"sync"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 // =============================================================
-// SECTION: In-memory data store
-// Real backends use a database (MySQL, Postgres, etc.) so data
-// survives a server restart. For now, we're keeping everything
-// in memory (a Go map) so you can focus on the request/response
-// logic first — we'll swap this for a real database once this
-// is working end-to-end. Because Go can handle multiple requests
-// at once, we use a Mutex ("mutual exclusion" lock) to prevent
-// two requests from corrupting the map at the same time.
+// SECTION: Database
 // =============================================================
+var db *sql.DB
 
-type user struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-	Verified bool   `json:"verified"`
+// Connection details default to matching the `docker run` command
+// in the setup instructions exactly, so it works with zero extra
+// configuration — but every value can be overridden with an
+// environment variable if you ever point this at a different
+// MySQL instance (e.g. a hosted one later).
+func dbDSN() string {
+	host := getEnvOrDefault("DB_HOST", "127.0.0.1")
+	port := getEnvOrDefault("DB_PORT", "3306")
+	user := getEnvOrDefault("DB_USER", "root")
+	pass := getEnvOrDefault("DB_PASSWORD", "devpassword")
+	name := getEnvOrDefault("DB_NAME", "jamconnect")
+	// parseTime=true lets the driver convert MySQL DATETIME columns
+	// directly to/from Go's time.Time — without it, times come back
+	// as raw byte strings you'd have to parse yourself.
+	return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true", user, pass, host, port, name)
 }
 
-var (
-	usersMu   sync.Mutex
-	users     = map[string]*user{} // key: normalized email
-	pendingMu sync.Mutex
-	pending   = map[string]string{} // key: email, value: verification code
+func getEnvOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
-	// Separate from signup verification codes above — this map holds
-	// password-reset codes. Kept distinct because they mean different
-	// things: a signup code proves "this email can receive mail before
-	// we let you in at all"; a reset code proves "you still control
-	// this already-verified account" for an existing user.
-	resetCodesMu sync.Mutex
-	resetCodes   = map[string]string{}
-)
+func initDB() {
+	var err error
+	db, err = sql.Open("mysql", dbDSN())
+	if err != nil {
+		log.Fatalf("Failed to open database connection: %v", err)
+	}
 
-var emailRegex = regexp.MustCompile(`^[\w.\-]+@[\w\-]+\.[a-zA-Z]{2,}$`)
+	// A freshly-started Docker MySQL container can take a few
+	// seconds to become ready to accept connections (especially the
+	// very first run, while it initializes its data files). Retrying
+	// a few times avoids a confusing crash if this server happens to
+	// start before MySQL has finished booting.
+	var pingErr error
+	for attempt := 1; attempt <= 10; attempt++ {
+		pingErr = db.Ping()
+		if pingErr == nil {
+			break
+		}
+		log.Printf("[DB] Waiting for MySQL to be ready... (attempt %d/10)", attempt)
+		time.Sleep(2 * time.Second)
+	}
+	if pingErr != nil {
+		log.Fatalf("Could not connect to MySQL after 10 attempts: %v\n"+
+			"Is the Docker container running? Try: docker ps", pingErr)
+	}
+
+	schema := []string{
+		`CREATE TABLE IF NOT EXISTS users (
+			email      VARCHAR(255) PRIMARY KEY,
+			password   VARCHAR(255) NOT NULL,
+			verified   BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at DATETIME NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS signup_codes (
+			email      VARCHAR(255) PRIMARY KEY,
+			code       VARCHAR(16) NOT NULL,
+			created_at DATETIME NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS reset_codes (
+			email      VARCHAR(255) PRIMARY KEY,
+			code       VARCHAR(16) NOT NULL,
+			created_at DATETIME NOT NULL
+		)`,
+	}
+	for _, stmt := range schema {
+		if _, err := db.Exec(stmt); err != nil {
+			log.Fatalf("Failed to create tables: %v", err)
+		}
+	}
+
+	log.Println("[DB] Connected to MySQL, tables ready")
+}
 
 func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
+var emailRegex = regexp.MustCompile(`^[\w.\-]+@[\w\-]+\.[a-zA-Z]{2,}$`)
+
 // =============================================================
 // SECTION: Request/response shapes
-// These structs define exactly what JSON a request must contain
-// and what JSON a response will return — Go's equivalent of the
-// jsonDecode/jsonEncode work AuthService does in Dart, but with
-// compile-time type checking instead of a loose Map.
 // =============================================================
 
+// signUpRequest now carries the full profile, not just credentials.
+// FullName/Phone/Parish/UserType are required for everyone. The
+// BusinessName through RateType fields only apply when
+// UserType == "service_provider" — customers simply leave them blank.
 type signUpRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+
+	FullName string `json:"fullName"`
+	Phone    string `json:"phone"`
+	Parish   string `json:"parish"`
+	UserType string `json:"userType"` // "customer" or "service_provider"
+
+	// Service-provider-only fields (ignored for customers)
+	BusinessName       string  `json:"businessName"`
+	Category           string  `json:"category"`
+	Description        string  `json:"description"`
+	YearsExperience    int     `json:"yearsExperience"`
+	TRN                string  `json:"trn"`
+	BusinessRegistered bool    `json:"businessRegistered"`
+	StartingRate       float64 `json:"startingRate"`
+	RateType           string  `json:"rateType"`
 }
 
 type loginRequest struct {
@@ -92,9 +166,7 @@ type resetPasswordRequest struct {
 type apiResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
-	// Code is only populated in the sign-up response, simulating
-	// what would normally be emailed to the user.
-	Code string `json:"code,omitempty"`
+	Code    string `json:"code,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -115,10 +187,6 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /signup  { "email": "...", "password": "..." }
-// Validates email format + password strength, rejects duplicates,
-// creates an unverified account, and generates a verification
-// code (returned directly in the response for now — simulating
-// an email send, same approach as the Flutter-only version).
 func signUpHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
@@ -132,6 +200,7 @@ func signUpHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	email := normalizeEmail(req.Email)
+	log.Printf("[SIGNUP] attempt: %s", email)
 
 	if email == "" || req.Password == "" {
 		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Email and password cannot be empty."})
@@ -150,21 +219,90 @@ func signUpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	usersMu.Lock()
-	_, exists := users[email]
-	if exists {
-		usersMu.Unlock()
-		writeJSON(w, http.StatusConflict, apiResponse{Message: "An account with this email already exists."})
+	// --- Profile fields, required for both account types ---
+	if strings.TrimSpace(req.FullName) == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Full name is required."})
 		return
 	}
-	users[email] = &user{Email: email, Password: req.Password, Verified: false}
-	usersMu.Unlock()
+	if strings.TrimSpace(req.Phone) == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Phone number is required."})
+		return
+	}
+	if strings.TrimSpace(req.Parish) == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Parish is required."})
+		return
+	}
+	if req.UserType != "customer" && req.UserType != "service_provider" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Account type must be 'customer' or 'service_provider'."})
+		return
+	}
+	// --- Extra requirements for service providers only ---
+	if req.UserType == "service_provider" {
+		if strings.TrimSpace(req.BusinessName) == "" {
+			writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Business name is required for service providers."})
+			return
+		}
+		if strings.TrimSpace(req.Category) == "" {
+			writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Service category is required for service providers."})
+			return
+		}
+	}
+
+	var exists int
+	err := db.QueryRow(`SELECT 1 FROM users WHERE email = ?`, email).Scan(&exists)
+	if err == nil {
+		log.Printf("[SIGNUP] rejected, already exists: %s", email)
+		writeJSON(w, http.StatusConflict, apiResponse{Message: "An account with this email already exists."})
+		return
+	} else if err != sql.ErrNoRows {
+		log.Printf("[SIGNUP] db error checking existing user: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	if _, err := db.Exec(
+		`INSERT INTO users (email, password, verified, created_at, full_name, phone, parish, user_type)
+		 VALUES (?, ?, FALSE, ?, ?, ?, ?, ?)`,
+		email, req.Password, time.Now(), req.FullName, req.Phone, req.Parish, req.UserType,
+	); err != nil {
+		log.Printf("[SIGNUP] db error inserting user: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	// Service providers get a second row in service_provider_profiles,
+	// holding everything specific to running a business that a
+	// customer account simply doesn't need.
+	if req.UserType == "service_provider" {
+		rateType := req.RateType
+		if rateType == "" {
+			rateType = "quote" // matches the ENUM default in the schema
+		}
+		if _, err := db.Exec(
+			`INSERT INTO service_provider_profiles
+			 (email, business_name, category, description, years_experience, trn, business_registered, starting_rate, rate_type)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			email, req.BusinessName, req.Category, req.Description, req.YearsExperience,
+			req.TRN, req.BusinessRegistered, req.StartingRate, rateType,
+		); err != nil {
+			log.Printf("[SIGNUP] db error inserting service provider profile: %v", err)
+			writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+			return
+		}
+	}
 
 	code := generateCode()
-	pendingMu.Lock()
-	pending[email] = code
-	pendingMu.Unlock()
+	if _, err := db.Exec(
+		`INSERT INTO signup_codes (email, code, created_at) VALUES (?, ?, ?)
+		 ON DUPLICATE KEY UPDATE code = VALUES(code), created_at = VALUES(created_at)`,
+		email, code, time.Now(),
+	); err != nil {
+		log.Printf("[SIGNUP] db error storing verification code: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
 
+	log.Printf("[SIGNUP] account created, verification pending: %s", email)
 	writeJSON(w, http.StatusCreated, apiResponse{
 		Success: true,
 		Message: "Account created. Verification code generated (simulated email).",
@@ -187,25 +325,22 @@ func verifyHandler(w http.ResponseWriter, r *http.Request) {
 
 	email := normalizeEmail(req.Email)
 
-	pendingMu.Lock()
-	expected, ok := pending[email]
-	pendingMu.Unlock()
-
-	if !ok || expected != strings.TrimSpace(req.Code) {
+	var expected string
+	err := db.QueryRow(`SELECT code FROM signup_codes WHERE email = ?`, email).Scan(&expected)
+	if err != nil || expected != strings.TrimSpace(req.Code) {
+		log.Printf("[VERIFY] failed for %s: incorrect or expired code", email)
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect or expired verification code."})
 		return
 	}
 
-	usersMu.Lock()
-	if u, exists := users[email]; exists {
-		u.Verified = true
+	if _, err := db.Exec(`UPDATE users SET verified = TRUE WHERE email = ?`, email); err != nil {
+		log.Printf("[VERIFY] db error updating user: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
 	}
-	usersMu.Unlock()
+	db.Exec(`DELETE FROM signup_codes WHERE email = ?`, email)
 
-	pendingMu.Lock()
-	delete(pending, email)
-	pendingMu.Unlock()
-
+	log.Printf("[VERIFY] success: %s", email)
 	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Email verified successfully."})
 }
 
@@ -223,40 +358,37 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	email := normalizeEmail(req.Email)
+	log.Printf("[LOGIN] attempt: %s", email)
 
-	usersMu.Lock()
-	u, exists := users[email]
-	usersMu.Unlock()
-
-	if !exists {
+	var password string
+	var verified bool
+	err := db.QueryRow(`SELECT password, verified FROM users WHERE email = ?`, email).Scan(&password, &verified)
+	if err == sql.ErrNoRows {
+		log.Printf("[LOGIN] failed for %s: no account found", email)
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
 		return
+	} else if err != nil {
+		log.Printf("[LOGIN] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
 	}
-	if u.Password != req.Password {
+
+	if password != req.Password {
+		log.Printf("[LOGIN] failed for %s: incorrect password", email)
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
 		return
 	}
-	if !u.Verified {
+	if !verified {
+		log.Printf("[LOGIN] failed for %s: email not verified", email)
 		writeJSON(w, http.StatusForbidden, apiResponse{Message: "Please verify your email before logging in."})
 		return
 	}
 
+	log.Printf("[LOGIN] success: %s", email)
 	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Login successful."})
 }
 
 // GET /check-email?email=...
-// Looks up whether an account exists for this email, WITHOUT
-// requiring a password. Used by the sign-up screen to warn the
-// user early that an email is already taken, before they type
-// out a whole password.
-//
-// Security note: publicly confirming "this email exists" is
-// known as account enumeration — it lets someone probe which
-// emails are registered. That's an accepted tradeoff for a
-// sign-up "is this taken?" check (most real apps do this), but
-// you would NOT do the same thing on a password-reset flow —
-// there, best practice is to always say "if this email exists,
-// we've sent a link" regardless of the real answer.
 func checkEmailHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use GET"})
@@ -269,25 +401,19 @@ func checkEmailHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	usersMu.Lock()
-	_, exists := users[email]
-	usersMu.Unlock()
-
-	writeJSON(w, http.StatusOK, map[string]bool{"exists": exists})
+	var exists int
+	err := db.QueryRow(`SELECT 1 FROM users WHERE email = ?`, email).Scan(&exists)
+	writeJSON(w, http.StatusOK, map[string]bool{"exists": err == nil})
 }
 
 // POST /resend-code  { "email": "..." }
-// Generates a fresh verification code for an existing, unverified
-// account and returns it (simulated email). Useful if the original
-// code was missed — which is easy to do, since it's only ever shown
-// briefly in the app rather than actually emailed.
 func resendCodeHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
 		return
 	}
 
-	var req signUpRequest // only the Email field is used here
+	var req signUpRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request body"})
 		return
@@ -295,24 +421,33 @@ func resendCodeHandler(w http.ResponseWriter, r *http.Request) {
 
 	email := normalizeEmail(req.Email)
 
-	usersMu.Lock()
-	u, exists := users[email]
-	usersMu.Unlock()
-
-	if !exists {
+	var verified bool
+	err := db.QueryRow(`SELECT verified FROM users WHERE email = ?`, email).Scan(&verified)
+	if err == sql.ErrNoRows {
 		writeJSON(w, http.StatusNotFound, apiResponse{Message: "No account found for this email."})
 		return
+	} else if err != nil {
+		log.Printf("[RESEND] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
 	}
-	if u.Verified {
+	if verified {
 		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "This account is already verified."})
 		return
 	}
 
 	code := generateCode()
-	pendingMu.Lock()
-	pending[email] = code
-	pendingMu.Unlock()
+	if _, err := db.Exec(
+		`INSERT INTO signup_codes (email, code, created_at) VALUES (?, ?, ?)
+		 ON DUPLICATE KEY UPDATE code = VALUES(code), created_at = VALUES(created_at)`,
+		email, code, time.Now(),
+	); err != nil {
+		log.Printf("[RESEND] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
 
+	log.Printf("[RESEND] new code generated: %s", email)
 	writeJSON(w, http.StatusOK, apiResponse{
 		Success: true,
 		Message: "New verification code generated (simulated email).",
@@ -325,22 +460,13 @@ func generateCode() string {
 }
 
 // POST /forgot-password  { "email": "..." }
-// Generates a password-reset code (simulated email, same as signup).
-//
-// Security note: unlike /check-email and /resend-code, this endpoint
-// deliberately gives the SAME response whether or not the email is
-// registered. Confirming "no account exists" on a password-reset
-// endpoint specifically is a known way to leak which emails are
-// registered to an attacker doing a targeted account takeover — so
-// real apps always say something like "if that account exists, we've
-// sent a code" here, even though it's fine to be specific on sign-up.
 func forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
 		return
 	}
 
-	var req signUpRequest // only Email is used
+	var req signUpRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request body"})
 		return
@@ -349,13 +475,17 @@ func forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
 	email := normalizeEmail(req.Email)
 	code := generateCode()
 
-	resetCodesMu.Lock()
-	resetCodes[email] = code
-	resetCodesMu.Unlock()
+	if _, err := db.Exec(
+		`INSERT INTO reset_codes (email, code, created_at) VALUES (?, ?, ?)
+		 ON DUPLICATE KEY UPDATE code = VALUES(code), created_at = VALUES(created_at)`,
+		email, code, time.Now(),
+	); err != nil {
+		log.Printf("[FORGOT-PASSWORD] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
 
-	// NOTE: because we have no real email system, the code is returned
-	// directly here so the UI can display it — a real app would omit
-	// `code` entirely and only ever deliver it via an actual email.
+	log.Printf("[FORGOT-PASSWORD] reset code generated for: %s", email)
 	writeJSON(w, http.StatusOK, apiResponse{
 		Success: true,
 		Message: "If that account exists, a reset code has been generated (simulated email).",
@@ -378,14 +508,10 @@ func resetPasswordHandler(w http.ResponseWriter, r *http.Request) {
 
 	email := normalizeEmail(req.Email)
 
-	resetCodesMu.Lock()
-	expected, ok := resetCodes[email]
-	resetCodesMu.Unlock()
-
-	// Same generic error whether the code is wrong OR the account
-	// doesn't exist at all — keeps behavior consistent with the
-	// non-enumeration note above.
-	if !ok || expected != strings.TrimSpace(req.Code) {
+	var expected string
+	err := db.QueryRow(`SELECT code FROM reset_codes WHERE email = ?`, email).Scan(&expected)
+	if err != nil || expected != strings.TrimSpace(req.Code) {
+		log.Printf("[RESET-PASSWORD] failed for %s: incorrect or expired code", email)
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect or expired reset code."})
 		return
 	}
@@ -399,28 +525,19 @@ func resetPasswordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	usersMu.Lock()
-	u, exists := users[email]
-	if exists {
-		u.Password = req.NewPassword
+	if _, err := db.Exec(`UPDATE users SET password = ? WHERE email = ?`, req.NewPassword, email); err != nil {
+		log.Printf("[RESET-PASSWORD] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
 	}
-	usersMu.Unlock()
+	db.Exec(`DELETE FROM reset_codes WHERE email = ?`, email)
 
-	resetCodesMu.Lock()
-	delete(resetCodes, email)
-	resetCodesMu.Unlock()
-
+	log.Printf("[RESET-PASSWORD] success: %s", email)
 	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Password reset successfully."})
 }
 
 // =============================================================
 // SECTION: CORS middleware
-// Your Flutter web app runs on a different port (e.g. localhost:
-// 51882) than this server (localhost:8080). Browsers block
-// cross-origin requests by default unless the server explicitly
-// allows it — this wrapper adds the headers that permit it.
-// Without this, Flutter's http requests to this server would
-// fail silently or throw a CORS error in the browser console.
 // =============================================================
 func withCORS(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -436,12 +553,10 @@ func withCORS(handler http.HandlerFunc) http.HandlerFunc {
 }
 
 // --- Entry point ---
-// Hosting platforms like Render assign a port dynamically and tell
-// your app which one to use via the PORT environment variable — your
-// server MUST listen on that port, not a hardcoded one, or the
-// platform won't be able to route traffic to it. Locally, no PORT
-// variable is set, so we fall back to 8080 like before.
 func main() {
+	initDB()
+	defer db.Close()
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
