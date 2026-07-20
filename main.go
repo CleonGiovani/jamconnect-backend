@@ -167,6 +167,9 @@ type apiResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 	Code    string `json:"code,omitempty"`
+	// Only populated by a successful login -- lets the frontend show
+	// a real "Welcome back, [name]" greeting instead of a generic one.
+	FullName string `json:"fullName,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -362,7 +365,9 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	var password string
 	var verified bool
-	err := db.QueryRow(`SELECT password, verified FROM users WHERE email = ?`, email).Scan(&password, &verified)
+	var fullName string
+	err := db.QueryRow(`SELECT password, verified, full_name FROM users WHERE email = ?`, email).
+		Scan(&password, &verified, &fullName)
 	if err == sql.ErrNoRows {
 		log.Printf("[LOGIN] failed for %s: no account found", email)
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
@@ -385,7 +390,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[LOGIN] success: %s", email)
-	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Login successful."})
+	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Login successful.", FullName: fullName})
 }
 
 // GET /check-email?email=...
