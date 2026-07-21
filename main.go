@@ -168,8 +168,11 @@ type apiResponse struct {
 	Message string `json:"message"`
 	Code    string `json:"code,omitempty"`
 	// Only populated by a successful login -- lets the frontend show
-	// a real "Welcome back, [name]" greeting instead of a generic one.
+	// a real "Welcome back, [name]" greeting, and know whether this
+	// user is a customer or service provider (e.g. to decide whether
+	// to show an "Edit My Profile" option at all).
 	FullName string `json:"fullName,omitempty"`
+	UserType string `json:"userType,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -247,6 +250,13 @@ func signUpHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if strings.TrimSpace(req.Category) == "" {
 			writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Service category is required for service providers."})
+			return
+		}
+		// Direct tester feedback: claiming "registered" without a TRN
+		// is a self-reported claim with no substance behind it -- if
+		// you check the box, you must back it up with the number.
+		if req.BusinessRegistered && strings.TrimSpace(req.TRN) == "" {
+			writeJSON(w, http.StatusBadRequest, apiResponse{Message: "A TRN is required if you're marking your business as registered."})
 			return
 		}
 	}
@@ -366,8 +376,9 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	var password string
 	var verified bool
 	var fullName string
-	err := db.QueryRow(`SELECT password, verified, full_name FROM users WHERE email = ?`, email).
-		Scan(&password, &verified, &fullName)
+	var userType string
+	err := db.QueryRow(`SELECT password, verified, full_name, user_type FROM users WHERE email = ?`, email).
+		Scan(&password, &verified, &fullName, &userType)
 	if err == sql.ErrNoRows {
 		log.Printf("[LOGIN] failed for %s: no account found", email)
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
@@ -390,7 +401,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[LOGIN] success: %s", email)
-	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Login successful.", FullName: fullName})
+	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Login successful.", FullName: fullName, UserType: userType})
 }
 
 // GET /check-email?email=...
@@ -485,6 +496,95 @@ func providersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, providers)
+}
+
+// updateProfileRequest carries both the fields being changed AND the
+// current password -- since this app has no session-token system,
+// requiring the password again is the honest way to confirm "you
+// actually own this account" before allowing a write to it. Without
+// this check, anyone who knew a provider's email could edit their
+// listing, since nothing else identifies who's making the request.
+type updateProfileRequest struct {
+	Email              string  `json:"email"`
+	Password           string  `json:"password"`
+	BusinessName       string  `json:"businessName"`
+	Category           string  `json:"category"`
+	Description        string  `json:"description"`
+	YearsExperience    int     `json:"yearsExperience"`
+	TRN                string  `json:"trn"`
+	BusinessRegistered bool    `json:"businessRegistered"`
+	StartingRate       float64 `json:"startingRate"`
+	RateType           string  `json:"rateType"`
+}
+
+// POST /providers/update
+func updateProfileHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	var req updateProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request body"})
+		return
+	}
+
+	email := normalizeEmail(req.Email)
+
+	// Same password check as login -- this IS the authorization check
+	// for this endpoint, not just a login formality.
+	var storedPassword string
+	err := db.QueryRow(`SELECT password FROM users WHERE email = ?`, email).Scan(&storedPassword)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
+		return
+	} else if err != nil {
+		log.Printf("[UPDATE-PROFILE] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	if storedPassword != req.Password {
+		log.Printf("[UPDATE-PROFILE] failed for %s: incorrect password", email)
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
+		return
+	}
+
+	// Same validation rules as signup -- editing shouldn't be able to
+	// produce an account state that signing up wouldn't have allowed.
+	if strings.TrimSpace(req.BusinessName) == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Business name is required."})
+		return
+	}
+	if strings.TrimSpace(req.Category) == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Service category is required."})
+		return
+	}
+	if req.BusinessRegistered && strings.TrimSpace(req.TRN) == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "A TRN is required if you're marking your business as registered."})
+		return
+	}
+
+	rateType := req.RateType
+	if rateType == "" {
+		rateType = "quote"
+	}
+
+	if _, err := db.Exec(
+		`UPDATE service_provider_profiles
+		 SET business_name = ?, category = ?, description = ?, years_experience = ?,
+		     trn = ?, business_registered = ?, starting_rate = ?, rate_type = ?
+		 WHERE email = ?`,
+		req.BusinessName, req.Category, req.Description, req.YearsExperience,
+		req.TRN, req.BusinessRegistered, req.StartingRate, rateType, email,
+	); err != nil {
+		log.Printf("[UPDATE-PROFILE] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	log.Printf("[UPDATE-PROFILE] success: %s", email)
+	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Profile updated successfully."})
 }
 
 // POST /resend-code  { "email": "..." }
@@ -649,6 +749,7 @@ func main() {
 	http.HandleFunc("/login", withCORS(loginHandler))
 	http.HandleFunc("/check-email", withCORS(checkEmailHandler))
 	http.HandleFunc("/providers", withCORS(providersHandler))
+	http.HandleFunc("/providers/update", withCORS(updateProfileHandler))
 	http.HandleFunc("/resend-code", withCORS(resendCodeHandler))
 	http.HandleFunc("/forgot-password", withCORS(forgotPasswordHandler))
 	http.HandleFunc("/reset-password", withCORS(resetPasswordHandler))
