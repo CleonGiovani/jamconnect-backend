@@ -103,6 +103,17 @@ func initDB() {
 			code       VARCHAR(16) NOT NULL,
 			created_at DATETIME NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS reviews (
+			review_id         INT AUTO_INCREMENT PRIMARY KEY,
+			provider_email    VARCHAR(255) NOT NULL,
+			customer_email    VARCHAR(255) NOT NULL,
+			customer_name     VARCHAR(255) NOT NULL,
+			rating            INT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+			review_text       TEXT NULL,
+			provider_response TEXT NULL,
+			created_at        DATETIME NOT NULL,
+			UNIQUE KEY one_review_per_customer (provider_email, customer_email)
+		)`,
 	}
 	for _, stmt := range schema {
 		if _, err := db.Exec(stmt); err != nil {
@@ -587,6 +598,211 @@ func updateProfileHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Profile updated successfully."})
 }
 
+// =============================================================
+// SECTION: Reviews
+// =============================================================
+
+type reviewListing struct {
+	ReviewID         int    `json:"reviewId"`
+	CustomerName     string `json:"customerName"`
+	Rating           int    `json:"rating"`
+	ReviewText       string `json:"reviewText"`
+	ProviderResponse string `json:"providerResponse"`
+	CreatedAt        string `json:"createdAt"`
+	// Included so the frontend can tell "is this my own review" (to
+	// hide the leave-a-review button after already reviewing) without
+	// a second request.
+	CustomerEmail string `json:"customerEmail"`
+}
+
+type submitReviewRequest struct {
+	ProviderEmail    string `json:"providerEmail"`
+	CustomerEmail    string `json:"customerEmail"`
+	CustomerPassword string `json:"customerPassword"`
+	Rating           int    `json:"rating"`
+	ReviewText       string `json:"reviewText"`
+}
+
+// POST /reviews/submit
+// Password-gated the same way as /providers/update -- proves the
+// reviewer actually owns the account they're submitting as, since
+// there's no session-token system to otherwise confirm identity.
+func submitReviewHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	var req submitReviewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request body"})
+		return
+	}
+
+	providerEmail := normalizeEmail(req.ProviderEmail)
+	customerEmail := normalizeEmail(req.CustomerEmail)
+
+	if providerEmail == customerEmail {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "You can't review your own listing."})
+		return
+	}
+	if req.Rating < 1 || req.Rating > 5 {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Rating must be between 1 and 5."})
+		return
+	}
+
+	var storedPassword, customerName string
+	err := db.QueryRow(`SELECT password, full_name FROM users WHERE email = ?`, customerEmail).
+		Scan(&storedPassword, &customerName)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
+		return
+	} else if err != nil {
+		log.Printf("[SUBMIT-REVIEW] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	if storedPassword != req.CustomerPassword {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
+		return
+	}
+
+	_, err = db.Exec(
+		`INSERT INTO reviews (provider_email, customer_email, customer_name, rating, review_text, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		providerEmail, customerEmail, customerName, req.Rating, req.ReviewText, time.Now(),
+	)
+	if err != nil {
+		// The UNIQUE KEY on (provider_email, customer_email) is what
+		// makes a duplicate insert fail here -- this is the "one
+		// review per customer per provider" rule being enforced by
+		// the database itself, not just application logic.
+		if strings.Contains(err.Error(), "Duplicate entry") {
+			writeJSON(w, http.StatusConflict, apiResponse{Message: "You've already reviewed this provider."})
+			return
+		}
+		log.Printf("[SUBMIT-REVIEW] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	log.Printf("[SUBMIT-REVIEW] success: %s reviewed %s", customerEmail, providerEmail)
+	writeJSON(w, http.StatusCreated, apiResponse{Success: true, Message: "Review submitted."})
+}
+
+// GET /reviews?provider=EMAIL
+func fetchReviewsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use GET"})
+		return
+	}
+
+	providerEmail := normalizeEmail(r.URL.Query().Get("provider"))
+	if providerEmail == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Missing provider query parameter."})
+		return
+	}
+
+	rows, err := db.Query(
+		`SELECT review_id, customer_name, rating, review_text, provider_response, created_at, customer_email
+		 FROM reviews WHERE provider_email = ? ORDER BY created_at DESC`,
+		providerEmail,
+	)
+	if err != nil {
+		log.Printf("[FETCH-REVIEWS] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	defer rows.Close()
+
+	reviews := []reviewListing{}
+	for rows.Next() {
+		var rv reviewListing
+		var response sql.NullString
+		var createdAt time.Time
+		if err := rows.Scan(&rv.ReviewID, &rv.CustomerName, &rv.Rating, &rv.ReviewText,
+			&response, &createdAt, &rv.CustomerEmail); err != nil {
+			log.Printf("[FETCH-REVIEWS] row scan error: %v", err)
+			continue
+		}
+		if response.Valid {
+			rv.ProviderResponse = response.String
+		}
+		rv.CreatedAt = createdAt.Format("2006-01-02")
+		reviews = append(reviews, rv)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[FETCH-REVIEWS] error while reading rows: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, reviews)
+}
+
+type respondReviewRequest struct {
+	ReviewID         int    `json:"reviewId"`
+	ProviderEmail    string `json:"providerEmail"`
+	ProviderPassword string `json:"providerPassword"`
+	ResponseText     string `json:"responseText"`
+}
+
+// POST /reviews/respond
+// Lets a provider respond to a review left on their own listing --
+// deliberately does NOT allow deleting or editing the review itself,
+// only adding a reply, matching the tester's specific feedback that
+// providers should be able to respond, not remove unwanted reviews.
+func respondReviewHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	var req respondReviewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request body"})
+		return
+	}
+
+	providerEmail := normalizeEmail(req.ProviderEmail)
+
+	var storedPassword string
+	err := db.QueryRow(`SELECT password FROM users WHERE email = ?`, providerEmail).Scan(&storedPassword)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
+		return
+	} else if err != nil {
+		log.Printf("[RESPOND-REVIEW] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	if storedPassword != req.ProviderPassword {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
+		return
+	}
+
+	// The WHERE clause checks provider_email too, not just review_id --
+	// this is what stops a provider from responding to a review left
+	// on a DIFFERENT provider's listing, not just password-checking.
+	result, err := db.Exec(
+		`UPDATE reviews SET provider_response = ? WHERE review_id = ? AND provider_email = ?`,
+		req.ResponseText, req.ReviewID, providerEmail,
+	)
+	if err != nil {
+		log.Printf("[RESPOND-REVIEW] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		writeJSON(w, http.StatusNotFound, apiResponse{Message: "Review not found, or it isn't on your own listing."})
+		return
+	}
+
+	log.Printf("[RESPOND-REVIEW] success: %s responded to review %d", providerEmail, req.ReviewID)
+	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Response saved."})
+}
+
 // POST /resend-code  { "email": "..." }
 func resendCodeHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -750,6 +966,9 @@ func main() {
 	http.HandleFunc("/check-email", withCORS(checkEmailHandler))
 	http.HandleFunc("/providers", withCORS(providersHandler))
 	http.HandleFunc("/providers/update", withCORS(updateProfileHandler))
+	http.HandleFunc("/reviews", withCORS(fetchReviewsHandler))
+	http.HandleFunc("/reviews/submit", withCORS(submitReviewHandler))
+	http.HandleFunc("/reviews/respond", withCORS(respondReviewHandler))
 	http.HandleFunc("/resend-code", withCORS(resendCodeHandler))
 	http.HandleFunc("/forgot-password", withCORS(forgotPasswordHandler))
 	http.HandleFunc("/reset-password", withCORS(resetPasswordHandler))
