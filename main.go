@@ -616,17 +616,19 @@ type reviewListing struct {
 }
 
 type submitReviewRequest struct {
-	ProviderEmail    string `json:"providerEmail"`
-	CustomerEmail    string `json:"customerEmail"`
-	CustomerPassword string `json:"customerPassword"`
-	Rating           int    `json:"rating"`
-	ReviewText       string `json:"reviewText"`
+	ProviderEmail string `json:"providerEmail"`
+	CustomerEmail string `json:"customerEmail"`
+	Rating        int    `json:"rating"`
+	ReviewText    string `json:"reviewText"`
 }
 
 // POST /reviews/submit
-// Password-gated the same way as /providers/update -- proves the
-// reviewer actually owns the account they're submitting as, since
-// there's no session-token system to otherwise confirm identity.
+// Deliberately NOT password-gated, unlike /providers/update and
+// /reviews/respond -- leaving a review is low-stakes enough that
+// re-confirming a password once already logged in was pure friction
+// with little real benefit. Still checks the account genuinely
+// exists (so a review can't be attributed to a made-up email), just
+// not that this specific request proves ongoing ownership of it.
 func submitReviewHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
@@ -651,19 +653,14 @@ func submitReviewHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var storedPassword, customerName string
-	err := db.QueryRow(`SELECT password, full_name FROM users WHERE email = ?`, customerEmail).
-		Scan(&storedPassword, &customerName)
+	var customerName string
+	err := db.QueryRow(`SELECT full_name FROM users WHERE email = ?`, customerEmail).Scan(&customerName)
 	if err == sql.ErrNoRows {
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
 		return
 	} else if err != nil {
 		log.Printf("[SUBMIT-REVIEW] db error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
-		return
-	}
-	if storedPassword != req.CustomerPassword {
-		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
 		return
 	}
 
