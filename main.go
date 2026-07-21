@@ -20,10 +20,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -448,6 +450,7 @@ type providerListing struct {
 	BusinessRegistered bool    `json:"businessRegistered"`
 	StartingRate       float64 `json:"startingRate"`
 	RateType           string  `json:"rateType"`
+	ProfilePhotoURL    string  `json:"profilePhotoUrl"`
 }
 
 // GET /providers
@@ -464,7 +467,7 @@ func providersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(`
-		SELECT u.email, u.full_name, u.phone, u.parish,
+		SELECT u.email, u.full_name, u.phone, u.parish, u.profile_photo_url,
 		       p.business_name, p.category, p.description,
 		       p.years_experience, p.business_registered,
 		       p.starting_rate, p.rate_type
@@ -483,14 +486,18 @@ func providersHandler(w http.ResponseWriter, r *http.Request) {
 	providers := []providerListing{} // starts as [] not null, so empty JSON is "[]" not "null"
 	for rows.Next() {
 		var p providerListing
+		var photoURL sql.NullString
 		if err := rows.Scan(
-			&p.Email, &p.FullName, &p.Phone, &p.Parish,
+			&p.Email, &p.FullName, &p.Phone, &p.Parish, &photoURL,
 			&p.BusinessName, &p.Category, &p.Description,
 			&p.YearsExperience, &p.BusinessRegistered,
 			&p.StartingRate, &p.RateType,
 		); err != nil {
 			log.Printf("[PROVIDERS] row scan error: %v", err)
 			continue
+		}
+		if photoURL.Valid {
+			p.ProfilePhotoURL = photoURL.String
 		}
 		providers = append(providers, p)
 	}
@@ -612,7 +619,8 @@ type reviewListing struct {
 	// Included so the frontend can tell "is this my own review" (to
 	// hide the leave-a-review button after already reviewing) without
 	// a second request.
-	CustomerEmail string `json:"customerEmail"`
+	CustomerEmail    string `json:"customerEmail"`
+	CustomerPhotoURL string `json:"customerPhotoUrl"`
 }
 
 type submitReviewRequest struct {
@@ -701,8 +709,11 @@ func fetchReviewsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(
-		`SELECT review_id, customer_name, rating, review_text, provider_response, created_at, customer_email
-		 FROM reviews WHERE provider_email = ? ORDER BY created_at DESC`,
+		`SELECT r.review_id, r.customer_name, r.rating, r.review_text, r.provider_response,
+		        r.created_at, r.customer_email, u.profile_photo_url
+		 FROM reviews r
+		 JOIN users u ON u.email = r.customer_email
+		 WHERE r.provider_email = ? ORDER BY r.created_at DESC`,
 		providerEmail,
 	)
 	if err != nil {
@@ -715,12 +726,15 @@ func fetchReviewsHandler(w http.ResponseWriter, r *http.Request) {
 	reviews := []reviewListing{}
 	for rows.Next() {
 		var rv reviewListing
-		var response sql.NullString
+		var response, photoURL sql.NullString
 		var createdAt time.Time
 		if err := rows.Scan(&rv.ReviewID, &rv.CustomerName, &rv.Rating, &rv.ReviewText,
-			&response, &createdAt, &rv.CustomerEmail); err != nil {
+			&response, &createdAt, &rv.CustomerEmail, &photoURL); err != nil {
 			log.Printf("[FETCH-REVIEWS] row scan error: %v", err)
 			continue
+		}
+		if photoURL.Valid {
+			rv.CustomerPhotoURL = photoURL.String
 		}
 		if response.Valid {
 			rv.ProviderResponse = response.String
@@ -798,6 +812,178 @@ func respondReviewHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[RESPOND-REVIEW] success: %s responded to review %d", providerEmail, req.ReviewID)
 	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Response saved."})
+}
+
+// =============================================================
+// SECTION: Profile photos
+// Photos are stored on local disk (same as everything else in this
+// app -- MySQL runs in a local Docker container, not a hosted
+// service), under uploads/profile-photos/. Filenames are derived
+// from the account's email so a re-upload cleanly replaces the old
+// photo rather than accumulating files.
+// =============================================================
+
+const uploadsDir = "uploads/profile-photos"
+
+var allowedPhotoExtensions = map[string]bool{
+	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true,
+}
+
+// sanitizeEmailForFilename turns an email into something safe to use
+// as a filename -- @ and . aren't valid/wise in filenames on every
+// OS, so they get replaced with underscores.
+func sanitizeEmailForFilename(email string) string {
+	replacer := strings.NewReplacer("@", "_at_", ".", "_")
+	return replacer.Replace(email)
+}
+
+// POST /profile-photo  (multipart/form-data: email, password, photo)
+// Password-gated like /providers/update -- a profile photo is part
+// of an account's public identity, so this follows the same "higher
+// stakes than a review" reasoning as editing a listing.
+func uploadProfilePhotoHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	// 10MB max -- generous for a profile photo, small enough to not
+	// let someone accidentally (or deliberately) fill up local disk.
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "File too large (max 10MB) or invalid form."})
+		return
+	}
+
+	email := normalizeEmail(r.FormValue("email"))
+	password := r.FormValue("password")
+
+	var storedPassword string
+	err := db.QueryRow(`SELECT password FROM users WHERE email = ?`, email).Scan(&storedPassword)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
+		return
+	} else if err != nil {
+		log.Printf("[UPLOAD-PHOTO] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	if storedPassword != password {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
+		return
+	}
+
+	file, header, err := r.FormFile("photo")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "No photo file provided."})
+		return
+	}
+	defer file.Close()
+
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if !allowedPhotoExtensions[ext] {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Only JPG, PNG, GIF, or WEBP images are allowed."})
+		return
+	}
+
+	if err := os.MkdirAll(uploadsDir, 0755); err != nil {
+		log.Printf("[UPLOAD-PHOTO] could not create uploads dir: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	filename := sanitizeEmailForFilename(email) + ext
+	destPath := filepath.Join(uploadsDir, filename)
+
+	dest, err := os.Create(destPath)
+	if err != nil {
+		log.Printf("[UPLOAD-PHOTO] could not create file: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	defer dest.Close()
+
+	if _, err := io.Copy(dest, file); err != nil {
+		log.Printf("[UPLOAD-PHOTO] could not save file: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	photoURL := "/uploads/profile-photos/" + filename
+	if _, err := db.Exec(`UPDATE users SET profile_photo_url = ? WHERE email = ?`, photoURL, email); err != nil {
+		log.Printf("[UPLOAD-PHOTO] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	log.Printf("[UPLOAD-PHOTO] success: %s", email)
+	writeJSON(w, http.StatusOK, map[string]string{"photoUrl": photoURL})
+}
+
+type myProfileRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type myProfileResponse struct {
+	Success         bool   `json:"success"`
+	Message         string `json:"message,omitempty"`
+	FullName        string `json:"fullName"`
+	Email           string `json:"email"`
+	Phone           string `json:"phone"`
+	Parish          string `json:"parish"`
+	UserType        string `json:"userType"`
+	ProfilePhotoURL string `json:"profilePhotoUrl"`
+}
+
+// POST /me  { "email": "...", "password": "..." }
+// Lets a logged-in user fetch their own current details -- used by
+// both the customer and provider "my profile" screens to show the
+// current photo (if any) before letting them replace it.
+func myProfileHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	var req myProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request body"})
+		return
+	}
+
+	email := normalizeEmail(req.Email)
+
+	var storedPassword, fullName, phone, parish, userType string
+	var photoURL sql.NullString
+	err := db.QueryRow(
+		`SELECT password, full_name, phone, parish, user_type, profile_photo_url FROM users WHERE email = ?`,
+		email,
+	).Scan(&storedPassword, &fullName, &phone, &parish, &userType, &photoURL)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
+		return
+	} else if err != nil {
+		log.Printf("[MY-PROFILE] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	if storedPassword != req.Password {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
+		return
+	}
+
+	resp := myProfileResponse{
+		Success:  true,
+		FullName: fullName,
+		Email:    email,
+		Phone:    phone,
+		Parish:   parish,
+		UserType: userType,
+	}
+	if photoURL.Valid {
+		resp.ProfilePhotoURL = photoURL.String
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // POST /resend-code  { "email": "..." }
@@ -966,6 +1152,16 @@ func main() {
 	http.HandleFunc("/reviews", withCORS(fetchReviewsHandler))
 	http.HandleFunc("/reviews/submit", withCORS(submitReviewHandler))
 	http.HandleFunc("/reviews/respond", withCORS(respondReviewHandler))
+	http.HandleFunc("/profile-photo", withCORS(uploadProfilePhotoHandler))
+	http.HandleFunc("/me", withCORS(myProfileHandler))
+
+	// Serves uploaded photos back out as plain static files, e.g. a
+	// file saved as uploads/profile-photos/foo.jpg becomes reachable
+	// at /uploads/profile-photos/foo.jpg. Wrapped in the same CORS
+	// middleware as everything else -- without it, the Flutter web
+	// app (a different origin) wouldn't be allowed to load the images.
+	fileServer := http.FileServer(http.Dir("uploads"))
+	http.Handle("/uploads/", withCORS(http.StripPrefix("/uploads/", fileServer).ServeHTTP))
 	http.HandleFunc("/resend-code", withCORS(resendCodeHandler))
 	http.HandleFunc("/forgot-password", withCORS(forgotPasswordHandler))
 	http.HandleFunc("/reset-password", withCORS(resetPasswordHandler))
