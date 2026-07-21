@@ -837,10 +837,11 @@ func sanitizeEmailForFilename(email string) string {
 	return replacer.Replace(email)
 }
 
-// POST /profile-photo  (multipart/form-data: email, password, photo)
-// Password-gated like /providers/update -- a profile photo is part
-// of an account's public identity, so this follows the same "higher
-// stakes than a review" reasoning as editing a listing.
+// POST /profile-photo  (multipart/form-data: email, photo)
+// Deliberately NOT password-gated, same reasoning as
+// /reviews/submit -- once already logged in, re-confirming a
+// password to upload your own photo is friction with little real
+// benefit. Still checks the account genuinely exists.
 func uploadProfilePhotoHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
@@ -855,20 +856,15 @@ func uploadProfilePhotoHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	email := normalizeEmail(r.FormValue("email"))
-	password := r.FormValue("password")
 
-	var storedPassword string
-	err := db.QueryRow(`SELECT password FROM users WHERE email = ?`, email).Scan(&storedPassword)
+	var exists int
+	err := db.QueryRow(`SELECT 1 FROM users WHERE email = ?`, email).Scan(&exists)
 	if err == sql.ErrNoRows {
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
 		return
 	} else if err != nil {
 		log.Printf("[UPLOAD-PHOTO] db error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
-		return
-	}
-	if storedPassword != password {
-		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
 		return
 	}
 
