@@ -117,10 +117,35 @@ func initDB() {
 			created_at        DATETIME NOT NULL,
 			UNIQUE KEY one_review_per_customer (provider_email, customer_email)
 		)`,
+		// One row per uploaded work-sample photo -- a provider can have
+		// many, unlike the single profile_photo_url on users.
+		`CREATE TABLE IF NOT EXISTS provider_photos (
+			photo_id    INT AUTO_INCREMENT PRIMARY KEY,
+			email       VARCHAR(255) NOT NULL,
+			photo_url   VARCHAR(500) NOT NULL,
+			uploaded_at DATETIME NOT NULL,
+			FOREIGN KEY (email) REFERENCES users(email) ON DELETE CASCADE
+		)`,
 	}
 	for _, stmt := range schema {
 		if _, err := db.Exec(stmt); err != nil {
 			log.Fatalf("Failed to create tables: %v", err)
+		}
+	}
+
+	// Existing databases already have service_provider_profiles
+	// without this column. Unlike CREATE TABLE, MySQL doesn't support
+	// "ADD COLUMN IF NOT EXISTS" the way some other databases do --
+	// adding a column that's already there (e.g. every restart after
+	// this was first applied) returns a real error. This is handled
+	// as its own step, separate from the fatal loop above, so that
+	// specific expected error can pass silently while any OTHER
+	// failure here still stops startup.
+	if _, err := db.Exec(
+		`ALTER TABLE service_provider_profiles ADD COLUMN registration_certificate_url VARCHAR(500) NULL`,
+	); err != nil {
+		if !strings.Contains(err.Error(), "Duplicate column name") {
+			log.Fatalf("Failed to migrate service_provider_profiles: %v", err)
 		}
 	}
 
@@ -512,18 +537,19 @@ func checkEmailHandler(w http.ResponseWriter, r *http.Request) {
 // field the Dashboard's list AND the full profile detail screen need,
 // so the frontend never has to make a second request per provider.
 type providerListing struct {
-	Email              string  `json:"email"`
-	FullName           string  `json:"fullName"`
-	Phone              string  `json:"phone"`
-	Parish             string  `json:"parish"`
-	BusinessName       string  `json:"businessName"`
-	Category           string  `json:"category"`
-	Description        string  `json:"description"`
-	YearsExperience    int     `json:"yearsExperience"`
-	BusinessRegistered bool    `json:"businessRegistered"`
-	StartingRate       float64 `json:"startingRate"`
-	RateType           string  `json:"rateType"`
-	ProfilePhotoURL    string  `json:"profilePhotoUrl"`
+	Email                      string  `json:"email"`
+	FullName                   string  `json:"fullName"`
+	Phone                      string  `json:"phone"`
+	Parish                     string  `json:"parish"`
+	BusinessName               string  `json:"businessName"`
+	Category                   string  `json:"category"`
+	Description                string  `json:"description"`
+	YearsExperience            int     `json:"yearsExperience"`
+	BusinessRegistered         bool    `json:"businessRegistered"`
+	StartingRate               float64 `json:"startingRate"`
+	RateType                   string  `json:"rateType"`
+	ProfilePhotoURL            string  `json:"profilePhotoUrl"`
+	RegistrationCertificateURL string  `json:"registrationCertificateUrl"`
 }
 
 // GET /providers
@@ -543,7 +569,7 @@ func providersHandler(w http.ResponseWriter, r *http.Request) {
 		SELECT u.email, u.full_name, u.phone, u.parish, u.profile_photo_url,
 		       p.business_name, p.category, p.description,
 		       p.years_experience, p.business_registered,
-		       p.starting_rate, p.rate_type
+		       p.starting_rate, p.rate_type, p.registration_certificate_url
 		FROM users u
 		JOIN service_provider_profiles p ON p.email = u.email
 		WHERE u.verified = TRUE
@@ -559,18 +585,21 @@ func providersHandler(w http.ResponseWriter, r *http.Request) {
 	providers := []providerListing{} // starts as [] not null, so empty JSON is "[]" not "null"
 	for rows.Next() {
 		var p providerListing
-		var photoURL sql.NullString
+		var photoURL, certURL sql.NullString
 		if err := rows.Scan(
 			&p.Email, &p.FullName, &p.Phone, &p.Parish, &photoURL,
 			&p.BusinessName, &p.Category, &p.Description,
 			&p.YearsExperience, &p.BusinessRegistered,
-			&p.StartingRate, &p.RateType,
+			&p.StartingRate, &p.RateType, &certURL,
 		); err != nil {
 			log.Printf("[PROVIDERS] row scan error: %v", err)
 			continue
 		}
 		if photoURL.Valid {
 			p.ProfilePhotoURL = photoURL.String
+		}
+		if certURL.Valid {
+			p.RegistrationCertificateURL = certURL.String
 		}
 		providers = append(providers, p)
 	}
@@ -1008,6 +1037,329 @@ func uploadProfilePhotoHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"photoUrl": photoURL})
 }
 
+// =============================================================
+// SECTION: Provider photo gallery ("Sample Work")
+// Unlike the single profile photo above, a provider can have MANY
+// gallery photos -- each upload adds a new row rather than replacing
+// one. Uploading stays password-free (same reasoning as the profile
+// photo); deleting is password-gated, since removing content is a
+// more consequential action than adding it.
+// =============================================================
+
+// POST /provider-photos  (multipart/form-data: email, photo)
+func uploadProviderPhotoHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "File too large (max 10MB) or invalid form."})
+		return
+	}
+
+	email := normalizeEmail(r.FormValue("email"))
+
+	var exists int
+	err := db.QueryRow(`SELECT 1 FROM users WHERE email = ?`, email).Scan(&exists)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
+		return
+	} else if err != nil {
+		log.Printf("[UPLOAD-PROVIDER-PHOTO] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	file, header, err := r.FormFile("photo")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "No photo file provided."})
+		return
+	}
+	defer file.Close()
+
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if !allowedPhotoExtensions[ext] {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Only JPG, PNG, GIF, or WEBP images are allowed."})
+		return
+	}
+
+	galleryDir := "uploads/provider-photos"
+	if err := os.MkdirAll(galleryDir, 0755); err != nil {
+		log.Printf("[UPLOAD-PROVIDER-PHOTO] could not create uploads dir: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	// Unlike the profile photo (one per account, filename = email), a
+	// gallery can hold MANY photos per account -- the filename needs
+	// to be unique per upload, not just per email. Combining the
+	// sanitized email with the current nanosecond timestamp keeps
+	// filenames unique without a database round-trip first just to
+	// generate an ID.
+	filename := fmt.Sprintf("%s-%d%s", sanitizeEmailForFilename(email), time.Now().UnixNano(), ext)
+	destPath := filepath.Join(galleryDir, filename)
+
+	dest, err := os.Create(destPath)
+	if err != nil {
+		log.Printf("[UPLOAD-PROVIDER-PHOTO] could not create file: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	defer dest.Close()
+
+	if _, err := io.Copy(dest, file); err != nil {
+		log.Printf("[UPLOAD-PROVIDER-PHOTO] could not save file: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	photoURL := "/uploads/provider-photos/" + filename
+	if _, err := db.Exec(
+		`INSERT INTO provider_photos (email, photo_url, uploaded_at) VALUES (?, ?, ?)`,
+		email, photoURL, time.Now(),
+	); err != nil {
+		log.Printf("[UPLOAD-PROVIDER-PHOTO] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	log.Printf("[UPLOAD-PROVIDER-PHOTO] success: %s", email)
+	writeJSON(w, http.StatusOK, map[string]string{"photoUrl": photoURL})
+}
+
+type providerPhotoListing struct {
+	PhotoID    int    `json:"photoId"`
+	PhotoURL   string `json:"photoUrl"`
+	UploadedAt string `json:"uploadedAt"`
+}
+
+// GET /provider-photos?email=EMAIL
+func fetchProviderPhotosHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use GET"})
+		return
+	}
+
+	email := normalizeEmail(r.URL.Query().Get("email"))
+	if email == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Missing email query parameter."})
+		return
+	}
+
+	rows, err := db.Query(
+		`SELECT photo_id, photo_url, uploaded_at FROM provider_photos WHERE email = ? ORDER BY uploaded_at DESC`,
+		email,
+	)
+	if err != nil {
+		log.Printf("[FETCH-PROVIDER-PHOTOS] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	defer rows.Close()
+
+	photos := []providerPhotoListing{}
+	for rows.Next() {
+		var p providerPhotoListing
+		var uploadedAt time.Time
+		if err := rows.Scan(&p.PhotoID, &p.PhotoURL, &uploadedAt); err != nil {
+			log.Printf("[FETCH-PROVIDER-PHOTOS] row scan error: %v", err)
+			continue
+		}
+		p.UploadedAt = uploadedAt.Format("2006-01-02")
+		photos = append(photos, p)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[FETCH-PROVIDER-PHOTOS] error while reading rows: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, photos)
+}
+
+type deleteProviderPhotoRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	PhotoID  int    `json:"photoId"`
+}
+
+// POST /provider-photos/delete
+// Password-gated, unlike adding a photo -- removing content is a
+// more consequential action than adding it.
+func deleteProviderPhotoHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	var req deleteProviderPhotoRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request body"})
+		return
+	}
+
+	email := normalizeEmail(req.Email)
+
+	var storedPassword string
+	err := db.QueryRow(`SELECT password FROM users WHERE email = ?`, email).Scan(&storedPassword)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
+		return
+	} else if err != nil {
+		log.Printf("[DELETE-PROVIDER-PHOTO] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	matches, needsUpgrade := checkPassword(storedPassword, req.Password)
+	if !matches {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
+		return
+	}
+	if needsUpgrade {
+		if newHash, hashErr := hashPassword(req.Password); hashErr == nil {
+			db.Exec(`UPDATE users SET password = ? WHERE email = ?`, newHash, email)
+		}
+	}
+
+	// SELECT first (not just DELETE) so the actual file on disk can
+	// also be cleaned up -- otherwise deleted photos would just pile
+	// up as orphaned files forever. The WHERE clause on the DELETE
+	// checks email too, not just photo_id -- that's what stops a
+	// provider from deleting a photo from a DIFFERENT provider's
+	// gallery, not just the password check above.
+	var photoURL string
+	err = db.QueryRow(
+		`SELECT photo_url FROM provider_photos WHERE photo_id = ? AND email = ?`,
+		req.PhotoID, email,
+	).Scan(&photoURL)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusNotFound, apiResponse{Message: "Photo not found, or it isn't yours."})
+		return
+	} else if err != nil {
+		log.Printf("[DELETE-PROVIDER-PHOTO] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	if _, err := db.Exec(`DELETE FROM provider_photos WHERE photo_id = ? AND email = ?`, req.PhotoID, email); err != nil {
+		log.Printf("[DELETE-PROVIDER-PHOTO] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	// Best-effort file cleanup -- not fatal if this fails, the
+	// database row (which controls what's actually displayed) is
+	// already gone either way.
+	if err := os.Remove(strings.TrimPrefix(photoURL, "/")); err != nil {
+		log.Printf("[DELETE-PROVIDER-PHOTO] could not remove file %s: %v", photoURL, err)
+	}
+
+	log.Printf("[DELETE-PROVIDER-PHOTO] success: %s deleted photo %d", email, req.PhotoID)
+	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Photo deleted."})
+}
+
+// =============================================================
+// SECTION: Registration certificate
+// Password-gated, unlike the photo uploads above -- this ties
+// directly to the "registered business" credibility claim, so it
+// gets the same protection as editing the listing itself. One file
+// per provider (like the profile photo), a fresh upload replaces
+// whatever was there before.
+// =============================================================
+
+// POST /registration-certificate  (multipart/form-data: email, password, certificate)
+func uploadCertificateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "File too large (max 10MB) or invalid form."})
+		return
+	}
+
+	email := normalizeEmail(r.FormValue("email"))
+	password := r.FormValue("password")
+
+	var storedPassword string
+	err := db.QueryRow(`SELECT password FROM users WHERE email = ?`, email).Scan(&storedPassword)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
+		return
+	} else if err != nil {
+		log.Printf("[UPLOAD-CERTIFICATE] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	matches, needsUpgrade := checkPassword(storedPassword, password)
+	if !matches {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
+		return
+	}
+	if needsUpgrade {
+		if newHash, hashErr := hashPassword(password); hashErr == nil {
+			db.Exec(`UPDATE users SET password = ? WHERE email = ?`, newHash, email)
+		}
+	}
+
+	file, header, err := r.FormFile("certificate")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "No certificate file provided."})
+		return
+	}
+	defer file.Close()
+
+	// Restricted to images for now (a photo or scan of the document)
+	// -- accepting PDFs too would need a different picker on the
+	// Flutter side, since image_picker only handles images.
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if !allowedPhotoExtensions[ext] {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Only JPG, PNG, GIF, or WEBP images are allowed."})
+		return
+	}
+
+	certDir := "uploads/certificates"
+	if err := os.MkdirAll(certDir, 0755); err != nil {
+		log.Printf("[UPLOAD-CERTIFICATE] could not create uploads dir: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	filename := sanitizeEmailForFilename(email) + ext
+	destPath := filepath.Join(certDir, filename)
+
+	dest, err := os.Create(destPath)
+	if err != nil {
+		log.Printf("[UPLOAD-CERTIFICATE] could not create file: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	defer dest.Close()
+
+	if _, err := io.Copy(dest, file); err != nil {
+		log.Printf("[UPLOAD-CERTIFICATE] could not save file: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	certURL := "/uploads/certificates/" + filename
+	if _, err := db.Exec(
+		`UPDATE service_provider_profiles SET registration_certificate_url = ? WHERE email = ?`,
+		certURL, email,
+	); err != nil {
+		log.Printf("[UPLOAD-CERTIFICATE] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	log.Printf("[UPLOAD-CERTIFICATE] success: %s", email)
+	writeJSON(w, http.StatusOK, map[string]string{"certificateUrl": certURL})
+}
+
 type myProfileRequest struct {
 	Email string `json:"email"`
 }
@@ -1247,6 +1599,10 @@ func main() {
 	http.HandleFunc("/reviews/submit", withCORS(submitReviewHandler))
 	http.HandleFunc("/reviews/respond", withCORS(respondReviewHandler))
 	http.HandleFunc("/profile-photo", withCORS(uploadProfilePhotoHandler))
+	http.HandleFunc("/provider-photos", withCORS(fetchProviderPhotosHandler))
+	http.HandleFunc("/provider-photos/upload", withCORS(uploadProviderPhotoHandler))
+	http.HandleFunc("/provider-photos/delete", withCORS(deleteProviderPhotoHandler))
+	http.HandleFunc("/registration-certificate", withCORS(uploadCertificateHandler))
 	http.HandleFunc("/me", withCORS(myProfileHandler))
 
 	// Serves uploaded photos back out as plain static files, e.g. a
