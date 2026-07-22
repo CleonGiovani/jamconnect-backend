@@ -31,6 +31,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // =============================================================
@@ -128,6 +129,56 @@ func initDB() {
 
 func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
+}
+
+// =============================================================
+// SECTION: Password hashing
+// Added after this app had already been running with plain-text
+// passwords for a while -- meaning real accounts already exist with
+// plain-text values stored. Switching login straight to bcrypt
+// comparison would lock all of them out immediately, since bcrypt
+// can't compare a hash against plain text.
+//
+// The fix is a standard, well-established pattern: lazy migration.
+// checkPassword() below handles BOTH a real bcrypt hash and a
+// legacy plain-text value, and reports back when it had to fall
+// back to the legacy path -- callers (login, profile updates) use
+// that signal to silently re-save the password as a real hash right
+// then, so every account gets upgraded the next time its owner
+// actually logs in, with zero disruption and no manual data
+// migration step required.
+// =============================================================
+
+// hashPassword converts a plain-text password into a bcrypt hash for
+// storage. bcrypt handles salting internally -- no separate salt
+// needs to be generated or stored alongside it.
+func hashPassword(plain string) (string, error) {
+	hashed, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(hashed), nil
+}
+
+// isBcryptHash detects whether a stored value is already a real
+// bcrypt hash (they always start with one of these three prefixes)
+// versus a legacy plain-text password from before this upgrade.
+func isBcryptHash(stored string) bool {
+	return strings.HasPrefix(stored, "$2a$") ||
+		strings.HasPrefix(stored, "$2b$") ||
+		strings.HasPrefix(stored, "$2y$")
+}
+
+// checkPassword verifies a provided password against whatever's
+// currently stored. needsUpgrade is true when the match only
+// succeeded via the legacy plain-text path -- the caller should
+// re-hash and save the password when this is true.
+func checkPassword(stored, provided string) (matches bool, needsUpgrade bool) {
+	if isBcryptHash(stored) {
+		err := bcrypt.CompareHashAndPassword([]byte(stored), []byte(provided))
+		return err == nil, false
+	}
+	return stored == provided, true
 }
 
 var emailRegex = regexp.MustCompile(`^[\w.\-]+@[\w\-]+\.[a-zA-Z]{2,}$`)
@@ -286,10 +337,17 @@ func signUpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	hashedPassword, err := hashPassword(req.Password)
+	if err != nil {
+		log.Printf("[SIGNUP] password hashing error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
 	if _, err := db.Exec(
 		`INSERT INTO users (email, password, verified, created_at, full_name, phone, parish, user_type)
 		 VALUES (?, ?, FALSE, ?, ?, ?, ?, ?)`,
-		email, req.Password, time.Now(), req.FullName, req.Phone, req.Parish, req.UserType,
+		email, hashedPassword, time.Now(), req.FullName, req.Phone, req.Parish, req.UserType,
 	); err != nil {
 		log.Printf("[SIGNUP] db error inserting user: %v", err)
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
@@ -402,7 +460,8 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if password != req.Password {
+	matches, needsUpgrade := checkPassword(password, req.Password)
+	if !matches {
 		log.Printf("[LOGIN] failed for %s: incorrect password", email)
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
 		return
@@ -411,6 +470,20 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[LOGIN] failed for %s: email not verified", email)
 		writeJSON(w, http.StatusForbidden, apiResponse{Message: "Please verify your email before logging in."})
 		return
+	}
+
+	// This account still had a plain-text password from before
+	// bcrypt was added -- now that it's just been correctly verified,
+	// silently upgrade it to a real hash. Not fatal if this fails;
+	// login still succeeds, and it'll just try again next time.
+	if needsUpgrade {
+		if newHash, hashErr := hashPassword(req.Password); hashErr == nil {
+			if _, updateErr := db.Exec(`UPDATE users SET password = ? WHERE email = ?`, newHash, email); updateErr != nil {
+				log.Printf("[LOGIN] could not upgrade legacy password for %s: %v", email, updateErr)
+			} else {
+				log.Printf("[LOGIN] upgraded legacy plain-text password to bcrypt for %s", email)
+			}
+		}
 	}
 
 	log.Printf("[LOGIN] success: %s", email)
@@ -562,10 +635,20 @@ func updateProfileHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
 		return
 	}
-	if storedPassword != req.Password {
+	matches, needsUpgrade := checkPassword(storedPassword, req.Password)
+	if !matches {
 		log.Printf("[UPDATE-PROFILE] failed for %s: incorrect password", email)
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
 		return
+	}
+	if needsUpgrade {
+		if newHash, hashErr := hashPassword(req.Password); hashErr == nil {
+			if _, updateErr := db.Exec(`UPDATE users SET password = ? WHERE email = ?`, newHash, email); updateErr != nil {
+				log.Printf("[UPDATE-PROFILE] could not upgrade legacy password for %s: %v", email, updateErr)
+			} else {
+				log.Printf("[UPDATE-PROFILE] upgraded legacy plain-text password to bcrypt for %s", email)
+			}
+		}
 	}
 
 	// Same validation rules as signup -- editing shouldn't be able to
@@ -787,9 +870,19 @@ func respondReviewHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
 		return
 	}
-	if storedPassword != req.ProviderPassword {
+	matches, needsUpgrade := checkPassword(storedPassword, req.ProviderPassword)
+	if !matches {
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
 		return
+	}
+	if needsUpgrade {
+		if newHash, hashErr := hashPassword(req.ProviderPassword); hashErr == nil {
+			if _, updateErr := db.Exec(`UPDATE users SET password = ? WHERE email = ?`, newHash, providerEmail); updateErr != nil {
+				log.Printf("[RESPOND-REVIEW] could not upgrade legacy password for %s: %v", providerEmail, updateErr)
+			} else {
+				log.Printf("[RESPOND-REVIEW] upgraded legacy plain-text password to bcrypt for %s", providerEmail)
+			}
+		}
 	}
 
 	// The WHERE clause checks provider_email too, not just review_id --
@@ -1099,7 +1192,14 @@ func resetPasswordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := db.Exec(`UPDATE users SET password = ? WHERE email = ?`, req.NewPassword, email); err != nil {
+	hashedPassword, err := hashPassword(req.NewPassword)
+	if err != nil {
+		log.Printf("[RESET-PASSWORD] password hashing error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	if _, err := db.Exec(`UPDATE users SET password = ? WHERE email = ?`, hashedPassword, email); err != nil {
 		log.Printf("[RESET-PASSWORD] db error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
 		return
