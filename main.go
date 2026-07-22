@@ -626,7 +626,6 @@ func providersHandler(w http.ResponseWriter, r *http.Request) {
 // listing, since nothing else identifies who's making the request.
 type updateProfileRequest struct {
 	Email              string  `json:"email"`
-	Password           string  `json:"password"`
 	BusinessName       string  `json:"businessName"`
 	Category           string  `json:"category"`
 	Description        string  `json:"description"`
@@ -638,6 +637,10 @@ type updateProfileRequest struct {
 }
 
 // POST /providers/update
+// Deliberately NOT password-gated, same reasoning as
+// /reviews/submit and the photo uploads -- once already logged in,
+// re-confirming a password for every account action was pure
+// friction. Still checks the account genuinely exists.
 func updateProfileHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
@@ -652,10 +655,8 @@ func updateProfileHandler(w http.ResponseWriter, r *http.Request) {
 
 	email := normalizeEmail(req.Email)
 
-	// Same password check as login -- this IS the authorization check
-	// for this endpoint, not just a login formality.
-	var storedPassword string
-	err := db.QueryRow(`SELECT password FROM users WHERE email = ?`, email).Scan(&storedPassword)
+	var exists int
+	err := db.QueryRow(`SELECT 1 FROM users WHERE email = ?`, email).Scan(&exists)
 	if err == sql.ErrNoRows {
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
 		return
@@ -663,21 +664,6 @@ func updateProfileHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[UPDATE-PROFILE] db error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
 		return
-	}
-	matches, needsUpgrade := checkPassword(storedPassword, req.Password)
-	if !matches {
-		log.Printf("[UPDATE-PROFILE] failed for %s: incorrect password", email)
-		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
-		return
-	}
-	if needsUpgrade {
-		if newHash, hashErr := hashPassword(req.Password); hashErr == nil {
-			if _, updateErr := db.Exec(`UPDATE users SET password = ? WHERE email = ?`, newHash, email); updateErr != nil {
-				log.Printf("[UPDATE-PROFILE] could not upgrade legacy password for %s: %v", email, updateErr)
-			} else {
-				log.Printf("[UPDATE-PROFILE] upgraded legacy plain-text password to bcrypt for %s", email)
-			}
-		}
 	}
 
 	// Same validation rules as signup -- editing shouldn't be able to
@@ -864,10 +850,9 @@ func fetchReviewsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type respondReviewRequest struct {
-	ReviewID         int    `json:"reviewId"`
-	ProviderEmail    string `json:"providerEmail"`
-	ProviderPassword string `json:"providerPassword"`
-	ResponseText     string `json:"responseText"`
+	ReviewID      int    `json:"reviewId"`
+	ProviderEmail string `json:"providerEmail"`
+	ResponseText  string `json:"responseText"`
 }
 
 // POST /reviews/respond
@@ -875,6 +860,8 @@ type respondReviewRequest struct {
 // deliberately does NOT allow deleting or editing the review itself,
 // only adding a reply, matching the tester's specific feedback that
 // providers should be able to respond, not remove unwanted reviews.
+// Deliberately NOT password-gated, same reasoning as the rest of
+// this backend now.
 func respondReviewHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
@@ -889,8 +876,8 @@ func respondReviewHandler(w http.ResponseWriter, r *http.Request) {
 
 	providerEmail := normalizeEmail(req.ProviderEmail)
 
-	var storedPassword string
-	err := db.QueryRow(`SELECT password FROM users WHERE email = ?`, providerEmail).Scan(&storedPassword)
+	var exists int
+	err := db.QueryRow(`SELECT 1 FROM users WHERE email = ?`, providerEmail).Scan(&exists)
 	if err == sql.ErrNoRows {
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
 		return
@@ -899,24 +886,10 @@ func respondReviewHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
 		return
 	}
-	matches, needsUpgrade := checkPassword(storedPassword, req.ProviderPassword)
-	if !matches {
-		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
-		return
-	}
-	if needsUpgrade {
-		if newHash, hashErr := hashPassword(req.ProviderPassword); hashErr == nil {
-			if _, updateErr := db.Exec(`UPDATE users SET password = ? WHERE email = ?`, newHash, providerEmail); updateErr != nil {
-				log.Printf("[RESPOND-REVIEW] could not upgrade legacy password for %s: %v", providerEmail, updateErr)
-			} else {
-				log.Printf("[RESPOND-REVIEW] upgraded legacy plain-text password to bcrypt for %s", providerEmail)
-			}
-		}
-	}
 
 	// The WHERE clause checks provider_email too, not just review_id --
 	// this is what stops a provider from responding to a review left
-	// on a DIFFERENT provider's listing, not just password-checking.
+	// on a DIFFERENT provider's listing.
 	result, err := db.Exec(
 		`UPDATE reviews SET provider_response = ? WHERE review_id = ? AND provider_email = ?`,
 		req.ResponseText, req.ReviewID, providerEmail,
@@ -1179,14 +1152,16 @@ func fetchProviderPhotosHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type deleteProviderPhotoRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-	PhotoID  int    `json:"photoId"`
+	Email   string `json:"email"`
+	PhotoID int    `json:"photoId"`
 }
 
 // POST /provider-photos/delete
-// Password-gated, unlike adding a photo -- removing content is a
-// more consequential action than adding it.
+// Deliberately NOT password-gated, same reasoning as the rest of
+// this backend now. Still checks the account exists, and the WHERE
+// clause on the DELETE below checks email too, not just photo_id --
+// that's what stops a provider from deleting a photo from a
+// DIFFERENT provider's gallery.
 func deleteProviderPhotoHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
@@ -1201,8 +1176,8 @@ func deleteProviderPhotoHandler(w http.ResponseWriter, r *http.Request) {
 
 	email := normalizeEmail(req.Email)
 
-	var storedPassword string
-	err := db.QueryRow(`SELECT password FROM users WHERE email = ?`, email).Scan(&storedPassword)
+	var exists int
+	err := db.QueryRow(`SELECT 1 FROM users WHERE email = ?`, email).Scan(&exists)
 	if err == sql.ErrNoRows {
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
 		return
@@ -1210,17 +1185,6 @@ func deleteProviderPhotoHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[DELETE-PROVIDER-PHOTO] db error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
 		return
-	}
-
-	matches, needsUpgrade := checkPassword(storedPassword, req.Password)
-	if !matches {
-		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
-		return
-	}
-	if needsUpgrade {
-		if newHash, hashErr := hashPassword(req.Password); hashErr == nil {
-			db.Exec(`UPDATE users SET password = ? WHERE email = ?`, newHash, email)
-		}
 	}
 
 	// SELECT first (not just DELETE) so the actual file on disk can
@@ -1262,14 +1226,12 @@ func deleteProviderPhotoHandler(w http.ResponseWriter, r *http.Request) {
 
 // =============================================================
 // SECTION: Registration certificate
-// Password-gated, unlike the photo uploads above -- this ties
-// directly to the "registered business" credibility claim, so it
-// gets the same protection as editing the listing itself. One file
-// per provider (like the profile photo), a fresh upload replaces
-// whatever was there before.
+// Deliberately NOT password-gated, same reasoning as the rest of
+// this backend now. One file per provider (like the profile photo),
+// a fresh upload replaces whatever was there before.
 // =============================================================
 
-// POST /registration-certificate  (multipart/form-data: email, password, certificate)
+// POST /registration-certificate  (multipart/form-data: email, certificate)
 func uploadCertificateHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
@@ -1282,10 +1244,9 @@ func uploadCertificateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	email := normalizeEmail(r.FormValue("email"))
-	password := r.FormValue("password")
 
-	var storedPassword string
-	err := db.QueryRow(`SELECT password FROM users WHERE email = ?`, email).Scan(&storedPassword)
+	var exists int
+	err := db.QueryRow(`SELECT 1 FROM users WHERE email = ?`, email).Scan(&exists)
 	if err == sql.ErrNoRows {
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
 		return
@@ -1293,17 +1254,6 @@ func uploadCertificateHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[UPLOAD-CERTIFICATE] db error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
 		return
-	}
-
-	matches, needsUpgrade := checkPassword(storedPassword, password)
-	if !matches {
-		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
-		return
-	}
-	if needsUpgrade {
-		if newHash, hashErr := hashPassword(password); hashErr == nil {
-			db.Exec(`UPDATE users SET password = ? WHERE email = ?`, newHash, email)
-		}
 	}
 
 	file, header, err := r.FormFile("certificate")
