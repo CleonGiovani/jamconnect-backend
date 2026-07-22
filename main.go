@@ -126,6 +126,23 @@ func initDB() {
 			uploaded_at DATETIME NOT NULL,
 			FOREIGN KEY (email) REFERENCES users(email) ON DELETE CASCADE
 		)`,
+		// status starts 'pending' -- the provider must confirm or
+		// decline before it's a real appointment. A customer can
+		// cancel their own; a provider can also mark one 'completed'
+		// once the work is actually done.
+		`CREATE TABLE IF NOT EXISTS bookings (
+			booking_id     INT AUTO_INCREMENT PRIMARY KEY,
+			provider_email VARCHAR(255) NOT NULL,
+			customer_email VARCHAR(255) NOT NULL,
+			requested_date DATE NOT NULL,
+			requested_time VARCHAR(20) NOT NULL,
+			notes          TEXT NULL,
+			status         ENUM('pending', 'confirmed', 'declined', 'completed', 'cancelled') NOT NULL DEFAULT 'pending',
+			created_at     DATETIME NOT NULL,
+			updated_at     DATETIME NOT NULL,
+			FOREIGN KEY (provider_email) REFERENCES users(email) ON DELETE CASCADE,
+			FOREIGN KEY (customer_email) REFERENCES users(email) ON DELETE CASCADE
+		)`,
 	}
 	for _, stmt := range schema {
 		if _, err := db.Exec(stmt); err != nil {
@@ -1513,6 +1530,237 @@ func resetPasswordHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // =============================================================
+// SECTION: Bookings
+// A customer requests a specific date/time from a provider; the
+// provider confirms or declines. Deliberately does NOT include any
+// calendar or availability-blocking logic -- that's a real feature
+// on its own (a provider marking which hours/days they're free),
+// left as a natural follow-up rather than half-built here. None of
+// these three endpoints are password-gated, matching the rest of
+// this backend now.
+// =============================================================
+
+type createBookingRequest struct {
+	ProviderEmail string `json:"providerEmail"`
+	CustomerEmail string `json:"customerEmail"`
+	RequestedDate string `json:"requestedDate"` // "2026-08-15"
+	RequestedTime string `json:"requestedTime"` // "14:00"
+	Notes         string `json:"notes"`
+}
+
+// POST /bookings/create
+func createBookingHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	var req createBookingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request body"})
+		return
+	}
+
+	providerEmail := normalizeEmail(req.ProviderEmail)
+	customerEmail := normalizeEmail(req.CustomerEmail)
+
+	if providerEmail == customerEmail {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "You can't book your own listing."})
+		return
+	}
+	if strings.TrimSpace(req.RequestedDate) == "" || strings.TrimSpace(req.RequestedTime) == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Please select a date and time."})
+		return
+	}
+
+	requestedDate, err := time.Parse("2006-01-02", req.RequestedDate)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid date format."})
+		return
+	}
+	// Truncated to the start of today, not the exact current moment,
+	// so booking for later today is still allowed.
+	today := time.Now().Truncate(24 * time.Hour)
+	if requestedDate.Before(today) {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Booking date can't be in the past."})
+		return
+	}
+
+	var exists int
+	if err := db.QueryRow(`SELECT 1 FROM users WHERE email = ?`, customerEmail).Scan(&exists); err == sql.ErrNoRows {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
+		return
+	} else if err != nil {
+		log.Printf("[CREATE-BOOKING] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	now := time.Now()
+	if _, err := db.Exec(
+		`INSERT INTO bookings (provider_email, customer_email, requested_date, requested_time, notes, status, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`,
+		providerEmail, customerEmail, req.RequestedDate, req.RequestedTime, req.Notes, now, now,
+	); err != nil {
+		log.Printf("[CREATE-BOOKING] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	log.Printf("[CREATE-BOOKING] success: %s requested a booking with %s", customerEmail, providerEmail)
+	writeJSON(w, http.StatusCreated, apiResponse{Success: true, Message: "Booking request sent."})
+}
+
+type bookingListing struct {
+	BookingID     int    `json:"bookingId"`
+	ProviderEmail string `json:"providerEmail"`
+	ProviderName  string `json:"providerName"`
+	CustomerEmail string `json:"customerEmail"`
+	CustomerName  string `json:"customerName"`
+	RequestedDate string `json:"requestedDate"`
+	RequestedTime string `json:"requestedTime"`
+	Notes         string `json:"notes"`
+	Status        string `json:"status"`
+	CreatedAt     string `json:"createdAt"`
+}
+
+// GET /bookings?email=EMAIL
+// Returns every booking where this email is EITHER the customer OR
+// the provider -- the frontend tells "my requests" from "requests to
+// me" apart by comparing each row against its own email, since one
+// account is always exactly one of the two roles per booking.
+func fetchBookingsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use GET"})
+		return
+	}
+
+	email := normalizeEmail(r.URL.Query().Get("email"))
+	if email == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Missing email query parameter."})
+		return
+	}
+
+	rows, err := db.Query(
+		`SELECT b.booking_id, b.provider_email, p.business_name, b.customer_email, cu.full_name,
+		        b.requested_date, b.requested_time, b.notes, b.status, b.created_at
+		 FROM bookings b
+		 JOIN service_provider_profiles p ON p.email = b.provider_email
+		 JOIN users cu ON cu.email = b.customer_email
+		 WHERE b.provider_email = ? OR b.customer_email = ?
+		 ORDER BY b.requested_date DESC, b.requested_time DESC`,
+		email, email,
+	)
+	if err != nil {
+		log.Printf("[FETCH-BOOKINGS] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+	defer rows.Close()
+
+	bookings := []bookingListing{}
+	for rows.Next() {
+		var b bookingListing
+		var requestedDate, createdAt time.Time
+		var notes sql.NullString
+		if err := rows.Scan(&b.BookingID, &b.ProviderEmail, &b.ProviderName, &b.CustomerEmail, &b.CustomerName,
+			&requestedDate, &b.RequestedTime, &notes, &b.Status, &createdAt); err != nil {
+			log.Printf("[FETCH-BOOKINGS] row scan error: %v", err)
+			continue
+		}
+		b.RequestedDate = requestedDate.Format("2006-01-02")
+		b.CreatedAt = createdAt.Format("2006-01-02")
+		if notes.Valid {
+			b.Notes = notes.String
+		}
+		bookings = append(bookings, b)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[FETCH-BOOKINGS] error while reading rows: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, bookings)
+}
+
+type updateBookingStatusRequest struct {
+	BookingID  int    `json:"bookingId"`
+	ActorEmail string `json:"actorEmail"`
+	NewStatus  string `json:"newStatus"` // "confirmed", "declined", "cancelled", "completed"
+}
+
+var validBookingStatuses = map[string]bool{
+	"confirmed": true,
+	"declined":  true,
+	"cancelled": true,
+	"completed": true,
+}
+
+// POST /bookings/update-status
+// A provider can confirm, decline, or mark a booking complete. A
+// customer can only cancel their own. This is enforced by checking
+// which side of the booking actorEmail actually matches in the
+// database, not just trusting whatever the client claims.
+func updateBookingStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
+		return
+	}
+
+	var req updateBookingStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request body"})
+		return
+	}
+
+	if !validBookingStatuses[req.NewStatus] {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid status."})
+		return
+	}
+
+	actorEmail := normalizeEmail(req.ActorEmail)
+
+	var providerEmail, customerEmail string
+	err := db.QueryRow(
+		`SELECT provider_email, customer_email FROM bookings WHERE booking_id = ?`,
+		req.BookingID,
+	).Scan(&providerEmail, &customerEmail)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusNotFound, apiResponse{Message: "Booking not found."})
+		return
+	} else if err != nil {
+		log.Printf("[UPDATE-BOOKING] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	isProvider := actorEmail == providerEmail
+	isCustomer := actorEmail == customerEmail
+
+	if req.NewStatus == "cancelled" && !isCustomer {
+		writeJSON(w, http.StatusForbidden, apiResponse{Message: "Only the customer who made this booking can cancel it."})
+		return
+	}
+	if req.NewStatus != "cancelled" && !isProvider {
+		writeJSON(w, http.StatusForbidden, apiResponse{Message: "Only the provider can do that."})
+		return
+	}
+
+	if _, err := db.Exec(
+		`UPDATE bookings SET status = ?, updated_at = ? WHERE booking_id = ?`,
+		req.NewStatus, time.Now(), req.BookingID,
+	); err != nil {
+		log.Printf("[UPDATE-BOOKING] db error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
+		return
+	}
+
+	log.Printf("[UPDATE-BOOKING] success: booking %d -> %s by %s", req.BookingID, req.NewStatus, actorEmail)
+	writeJSON(w, http.StatusOK, apiResponse{Success: true, Message: "Booking updated."})
+}
+
+// =============================================================
 // SECTION: CORS middleware
 // =============================================================
 func withCORS(handler http.HandlerFunc) http.HandlerFunc {
@@ -1553,6 +1801,9 @@ func main() {
 	http.HandleFunc("/provider-photos/upload", withCORS(uploadProviderPhotoHandler))
 	http.HandleFunc("/provider-photos/delete", withCORS(deleteProviderPhotoHandler))
 	http.HandleFunc("/registration-certificate", withCORS(uploadCertificateHandler))
+	http.HandleFunc("/bookings", withCORS(fetchBookingsHandler))
+	http.HandleFunc("/bookings/create", withCORS(createBookingHandler))
+	http.HandleFunc("/bookings/update-status", withCORS(updateBookingStatusHandler))
 	http.HandleFunc("/me", withCORS(myProfileHandler))
 
 	// Serves uploaded photos back out as plain static files, e.g. a
