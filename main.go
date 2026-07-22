@@ -916,8 +916,7 @@ func uploadProfilePhotoHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type myProfileRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Email string `json:"email"`
 }
 
 type myProfileResponse struct {
@@ -931,10 +930,13 @@ type myProfileResponse struct {
 	ProfilePhotoURL string `json:"profilePhotoUrl"`
 }
 
-// POST /me  { "email": "...", "password": "..." }
-// Lets a logged-in user fetch their own current details -- used by
-// both the customer and provider "my profile" screens to show the
-// current photo (if any) before letting them replace it.
+// POST /me  { "email": "..." }
+// Deliberately NOT password-gated -- this is a read-only lookup of
+// your own already-public-facing details (name, photo), same
+// reasoning as /reviews/submit and /profile-photo: once already
+// logged in, this is lower-stakes than even those two, since
+// nothing is being changed. Used by the "my profile" screens and
+// the Dashboard greeting to show your current photo on load.
 func myProfileHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Use POST"})
@@ -949,22 +951,18 @@ func myProfileHandler(w http.ResponseWriter, r *http.Request) {
 
 	email := normalizeEmail(req.Email)
 
-	var storedPassword, fullName, phone, parish, userType string
+	var fullName, phone, parish, userType string
 	var photoURL sql.NullString
 	err := db.QueryRow(
-		`SELECT password, full_name, phone, parish, user_type, profile_photo_url FROM users WHERE email = ?`,
+		`SELECT full_name, phone, parish, user_type, profile_photo_url FROM users WHERE email = ?`,
 		email,
-	).Scan(&storedPassword, &fullName, &phone, &parish, &userType, &photoURL)
+	).Scan(&fullName, &phone, &parish, &userType, &photoURL)
 	if err == sql.ErrNoRows {
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "No account found for this email."})
 		return
 	} else if err != nil {
 		log.Printf("[MY-PROFILE] db error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Server error, please try again."})
-		return
-	}
-	if storedPassword != req.Password {
-		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Incorrect password."})
 		return
 	}
 
